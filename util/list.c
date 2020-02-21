@@ -1,0 +1,732 @@
+/***************************************************************************//**
+ *   @file   list.c
+ *   @brief  List library implementation
+ *   @author Mihail Chindris (mihail.chindris@analog.com)
+********************************************************************************
+ * Copyright 2020(c) Analog Devices, Inc.
+ *
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *  - Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ *  - Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ *  - Neither the name of Analog Devices, Inc. nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *  - The use of this software may or may not infringe the patent rights
+ *    of one or more patent holders.  This license does not release you
+ *    from the requirement that you obtain separate licenses from these
+ *    patent holders to use this software.
+ *  - Use of the software either in source or binary form, must be run
+ *    on or directly connected to an Analog Devices Inc. component.
+ *
+ * THIS SOFTWARE IS PROVIDED BY ANALOG DEVICES "AS IS" AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, NON-INFRINGEMENT,
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL ANALOG DEVICES BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+ * LIMITED TO, INTELLECTUAL PROPERTY RIGHTS, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*******************************************************************************/
+
+/******************************************************************************/
+/***************************** Include Files **********************************/
+/******************************************************************************/
+
+#include "list.h"
+#include "error.h"
+#include <stdlib.h>
+
+/******************************************************************************/
+/*************************** Types Declarations *******************************/
+/******************************************************************************/
+
+/**
+ * @struct list_elem
+ * @brief Format of each element of the list
+ */
+struct list_elem {
+	/** User data */
+	void	*data;
+	/** Reference to previous element */
+	struct list_elem *prev;
+	/** Reference to next element */
+	struct list_elem *next;
+};
+
+/**
+ * @struct list_iterator
+ * @brief Structure used to iterate through the list
+ */
+struct list_iterator {
+	/** List reference */
+	struct list_desc	*list;
+	/** Current element reference */
+	struct list_elem	*elem;
+};
+
+/**
+ * @struct list_desc
+ * @brief List descriptor
+ */
+struct list_desc {
+	/** Reference to first element in the list */
+	struct list_elem	*first;
+	/** Reference to last element in the list*/
+	struct list_elem	*last;
+	/** Number of elements in the list */
+	uint32_t		nb_elements;
+	/** Function used to compare elements */
+	f_cmp			comparator;
+	/** Number of current active iterators */
+	uint32_t		nb_iterators;
+	/** Internal list iterator */
+	struct list_iterator	l_it;
+	/** List adapter */
+	struct list_adapter	adapter;
+};
+
+/** @brief Default function used to compare element in the list ( \ref f_cmp) */
+static int32_t default_comparator(void *data1, void *data2)
+{
+	return (int32_t)(data1 - data2);
+}
+
+/**
+ * @brief Set parameter if not null
+ * @param res - Where to store val
+ * @param val - Value to be set
+ */
+static inline void set_result(int32_t *res, int32_t val)
+{
+	if (res)
+		*res = val;
+}
+
+/**
+ * @brief Creates a new list elements an configure its value
+ * @param data - To set list_elem.data
+ * @param prev - To set list_elem.prev
+ * @param next - To set list_elem.next
+ * @return Address of the new element or NULL if allocation fails.
+ */
+static inline struct list_elem *create_element(void *data,
+		struct list_elem *prev,
+		struct list_elem *next)
+{
+	struct list_elem *elem;
+
+	elem = (struct list_elem *)calloc(1, sizeof(*elem));
+	if (!elem)
+		return NULL;
+	elem->data = data;
+	elem->prev = prev;
+	elem->next = next;
+
+	return (elem);
+}
+
+/**
+ * @brief Updates the necesary link on the list elements to add or remove one
+ * @param prev - Low element
+ * @param elem - Middle element
+ * @param next - High element
+ */
+static inline void update_links(struct list_elem *prev, struct list_elem *elem,
+				struct list_elem *next)
+{
+	if (prev)
+		prev->next = elem ? elem : next;
+	if (elem) {
+		elem->prev = prev;
+		elem->next = next;
+	}
+	if (next)
+		next->prev = elem ? elem : prev;
+}
+
+/**
+ * @brief Update according to modification the list descriptor
+ * @param list - List reference
+ * @param new_first - New first element
+ * @param new_last - New last element
+ */
+static inline void update_desc(struct list_desc *list,
+			       struct list_elem *new_first,
+			       struct list_elem *new_last)
+{
+	if (new_first == list->first) {
+		list->last = new_last;
+		if (new_first == NULL || new_last == NULL)
+			list->first = new_last;
+	} else {	/* if (new_last == list->last) */
+		list->first = new_first;
+		if (new_last == NULL || new_first == NULL)
+			list->last = new_first;
+	}
+}
+
+/**
+ * @brief Set the adapter functions acording to the adapter type
+ * @param ad - Reference of the adapter
+ * @param type - Type of the adapter
+ */
+static inline void set_adapter(struct list_adapter *ad, enum adapter_type type)
+{
+	switch (type) {
+	case LIST_PRIORITY_LIST:
+		*ad = (struct list_adapter) {
+			.push = list_add_find,
+			.pop = list_get_first,
+			.top_next = list_read_first,
+			.back = list_read_last,
+			.swap = list_edit_first,
+			.list = NULL
+		};
+		break;
+	case LIST_QUEUE:
+		*ad = (struct list_adapter) {
+			.push = list_add_last,
+			.pop = list_get_first,
+			.top_next = list_read_first,
+			.back = list_read_last,
+			.swap = list_edit_first,
+			.list = NULL
+		};
+		break;
+	case LIST_DEFAULT:
+	case LIST_STACK:
+	default:
+		*ad = (struct list_adapter) {
+			.push = list_add_last,
+			.pop = list_get_last,
+			.top_next = list_read_last,
+			.back = list_read_first,
+			.swap = list_edit_last,
+			.list = NULL
+		};
+		break;
+	}
+}
+
+int32_t list_init(List_desc *list_desc, f_cmp comparator,
+		  struct list_adapter **adapter, enum adapter_type type)
+{
+	struct list_desc	*list;
+
+	if (!list_desc)
+		return FAILURE;
+	list = (struct list_desc *)calloc(1, sizeof(*list));
+	if (!list)
+		return FAILURE;
+
+	*list_desc = list;
+	list->comparator = comparator ? comparator : default_comparator;
+
+	/* Configure wrapper */
+	set_adapter(&list->adapter, type);
+	list->adapter.list = list;
+	list->l_it.list = list;
+	if (adapter)
+		*adapter = &list->adapter;
+
+	return SUCCESS;
+}
+
+int32_t	list_remove(List_desc list_desc)
+{
+	struct list_desc	*list = list_desc;
+	void			*data;
+
+	if (!list)
+		return FAILURE;
+
+	if (list->nb_iterators != 0)
+		return FAILURE;
+
+	/* Remove all the elements */
+	data = list_get_first(list_desc, NULL);
+	while (data)
+		data = list_get_first(list_desc, NULL);
+	free(list_desc);
+
+	return SUCCESS;
+}
+
+int32_t list_get_size(List_desc list_desc, uint32_t *out_size)
+{
+	if (!list_desc || !out_size)
+		return FAILURE;
+
+	*out_size = ((struct list_desc *)list_desc)->nb_elements;
+
+	return SUCCESS;
+}
+
+int32_t list_add_first(List_desc list_desc, void *data)
+{
+	struct list_desc *list = list_desc;
+	struct list_elem *prev;
+	struct list_elem *next;
+	struct list_elem *elem;
+
+	if (!list)
+		return FAILURE;
+
+	prev = NULL;
+	next = list->first;
+
+	elem = create_element(data, prev, next);
+	if (!elem)
+		return FAILURE;
+
+	update_links(prev, elem, next);
+
+	update_desc(list, elem, list->last);
+
+	list->nb_elements++;
+
+	return SUCCESS;
+}
+
+int32_t list_add_last(List_desc list_desc, void *data)
+{
+	struct list_desc *list = list_desc;
+	struct list_elem *prev;
+	struct list_elem *next;
+	struct list_elem *elem;
+
+	if (!list)
+		return FAILURE;
+
+	prev = list->last;
+	next = NULL;
+
+	elem = create_element(data, prev, next);
+	if (!elem)
+		return FAILURE;
+
+	update_links(prev, elem, next);
+
+	update_desc(list, list->first, elem);
+
+	list->nb_elements++;
+
+	return SUCCESS;
+}
+
+int32_t list_add_idx(List_desc list_desc, void *data, uint32_t idx)
+{
+	struct list_desc	*list = list_desc;
+
+	if (!list)
+		return FAILURE;
+
+	/* If there are no elements the creation of an iterator will fail */
+	if (list->nb_elements == 0 || idx == 0)
+		return list_add_first(list_desc, data);
+	if (list->nb_elements == idx)
+		return list_add_last(list_desc, data);
+
+	list->l_it.elem = list->first;
+	if (SUCCESS != iterator_move(&(list->l_it), idx))
+		return FAILURE;
+
+	return iterator_insert(&(list->l_it), data, 0);
+}
+
+int32_t list_add_find(List_desc list_desc, void *data)
+{
+	struct list_desc	*list = list_desc;
+	struct list_elem	*elem;
+
+	if (!list)
+		return FAILURE;
+
+	/* Based on place iterator */
+	elem = list->first;
+	while (elem) {
+		if (0 > list->comparator(data, elem->data))
+			break;
+		elem = elem->next;
+	}
+	if (elem == NULL) {
+		list->l_it.elem = list->last;
+		return iterator_insert(&(list->l_it), data, 1);
+	} else {
+		list->l_it.elem = elem;
+		return iterator_insert(&(list->l_it), data, 0);
+	}
+
+}
+
+int32_t list_edit_first(List_desc list_desc, void *new_data)
+{
+	struct list_desc *list = list_desc;
+
+	if (!list)
+		return FAILURE;
+
+	list->first->data = new_data;
+
+	return SUCCESS;
+}
+
+int32_t list_edit_last(List_desc list_desc, void *new_data)
+{
+	struct list_desc *list = list_desc;
+
+	if (!list)
+		return FAILURE;
+
+	list->last->data = new_data;
+
+	return SUCCESS;
+}
+
+int32_t list_edit_idx(List_desc list_desc, void *new_data, uint32_t idx)
+{
+	struct list_desc	*list = list_desc;
+
+	if (!list)
+		return FAILURE;
+
+	list->l_it.elem = list->first;
+	if (SUCCESS != iterator_move(&(list->l_it), idx))
+		return FAILURE;
+
+	return iterator_edit(&(list->l_it), new_data);
+}
+
+int32_t list_edit_find(List_desc list_desc, void *new_data, void *cmp_data)
+{
+	struct list_desc	*list = list_desc;
+
+	if (!list)
+		return FAILURE;
+
+	list->l_it.elem = list->first;
+	if (SUCCESS != iterator_find(&(list->l_it), cmp_data))
+		return FAILURE;
+
+	return iterator_edit(&(list->l_it), new_data);
+}
+
+void*	list_read_first(List_desc list_desc, int32_t *result)
+{
+	struct list_desc *list = list_desc;
+
+	set_result(result, FAILURE);
+	if (!list)
+		return NULL;
+
+	if (!list->first)
+		return NULL;
+	set_result(result, SUCCESS);
+
+	return list->first->data;
+}
+
+void*	list_read_last(List_desc list_desc, int32_t *result)
+{
+	struct list_desc *list = list_desc;
+
+	set_result(result, FAILURE);
+	if (!list)
+		return NULL;
+
+	if (!list->last)
+		return NULL;
+	set_result(result, SUCCESS);
+
+	return (list->last->data);
+}
+
+void*	list_read_idx(List_desc list_desc, int32_t *result, uint32_t idx)
+{
+	struct list_desc	*list = list_desc;
+
+	set_result(result, FAILURE);
+	if (!list)
+		return NULL;
+
+	if (idx >= list->nb_elements)
+		return NULL;
+
+	list->l_it.elem = list->first;
+	if (SUCCESS != iterator_move(&(list->l_it), idx))
+		return NULL;
+
+	return iterator_read(&(list->l_it), result);
+}
+
+void*	list_read_find(List_desc list_desc, int32_t *result, void *cmp_data)
+{
+	struct list_desc	*list = list_desc;
+
+	set_result(result, FAILURE);
+	if (!list)
+		return NULL;
+
+	list->l_it.elem = list->first;
+	if (SUCCESS != iterator_find(&(list->l_it), cmp_data))
+		return NULL;
+
+	return iterator_read(&(list->l_it), result);
+}
+
+void*	list_get_first(List_desc list_desc, int32_t *result)
+{
+	struct list_desc *list = list_desc;
+	struct list_elem *prev;
+	struct list_elem *next;
+	struct list_elem *elem;
+	void		 *data;
+
+	set_result(result, FAILURE);
+	if (!list)
+		return NULL;
+
+	if (!list->nb_elements)
+		return NULL;
+
+	elem = list->first;
+	prev = elem->prev;
+	next = elem->next;
+
+	update_links(prev, NULL, next);
+	update_desc(list, next, list->last);
+	list->nb_elements--;
+
+	data = elem->data;
+	free(elem);
+	set_result(result, SUCCESS);
+
+	return (data);
+}
+
+void*	list_get_last(List_desc list_desc, int32_t *result)
+{
+	struct list_desc *list = list_desc;
+	struct list_elem *prev;
+	struct list_elem *next;
+	struct list_elem *elem;
+	void		 *data;
+
+	set_result(result, FAILURE);
+	if (!list)
+		return NULL;
+
+	if (!list->nb_elements)
+		return NULL;
+
+	elem = list->last;
+	prev = elem->prev;
+	next = elem->next;
+
+	update_links(prev, NULL, next);
+	update_desc(list, list->first, prev);
+	list->nb_elements--;
+
+	data = elem->data;
+	free(elem);
+	set_result(result, SUCCESS);
+
+	return (data);
+}
+
+void*	list_get_idx(List_desc list_desc, int32_t *result, uint32_t idx)
+{
+	struct list_desc	*list = list_desc;
+
+	set_result(result, FAILURE);
+	if (!list)
+		return NULL;
+
+	list->l_it.elem = list->first;
+	if (SUCCESS != iterator_move(&(list->l_it), idx))
+		return NULL;
+
+	return iterator_get(&(list->l_it), result);
+}
+
+void*	list_get_find(List_desc list_desc, int32_t *result, void *cmp_data)
+{
+	struct list_desc	*list = list_desc;
+
+	set_result(result, FAILURE);
+	if (!list)
+		return NULL;
+
+	list->l_it.elem = list->first;
+	if (SUCCESS != iterator_find(&(list->l_it), cmp_data))
+		return NULL;
+
+	return iterator_get(&(list->l_it), result);
+}
+
+int32_t iterator_init(Iterator *iter, List_desc list_desc, bool start)
+{
+	struct list_iterator	*it;
+
+	if (!list_desc)
+		return FAILURE;
+
+	it = (struct list_iterator *)calloc(1, sizeof(*it));
+	if (!it)
+		return FAILURE;
+	it->list = list_desc;
+	it->list->nb_iterators++;
+	it->elem = start ? it->list->first : it->list->last;
+	*iter = it;
+
+	return SUCCESS;
+}
+
+int32_t iterator_remove(Iterator iter)
+{
+	struct list_iterator *it = iter;
+
+	if (!it)
+		return FAILURE;
+
+	it->list->nb_iterators--;
+	free(it);
+
+	return SUCCESS;
+}
+
+int32_t	iterator_move(Iterator iter, int32_t idx)
+{
+	struct list_iterator	*it = iter;
+	struct list_elem	*elem;
+	int32_t			dir = (idx < 0) ? -1 : 1;
+
+	if (!it)
+		return FAILURE;
+
+	idx = abs(idx);
+	elem = it->elem;
+	while (idx > 0 && elem) {
+		elem = dir > 0 ? elem->next : elem->prev;
+		idx--;
+	}
+	if (!elem)
+		return FAILURE;
+
+	it->elem = elem;
+
+	return SUCCESS;
+}
+
+int32_t	iterator_find(Iterator iter, void *cmp_data)
+{
+	struct list_iterator	*it = iter;
+	struct list_elem	*elem;
+
+	if (!it)
+		return FAILURE;
+
+	elem = it->list->first;
+	while (elem) {
+		if (0 == it->list->comparator(elem->data, cmp_data)) {
+			it->elem = elem;
+			return SUCCESS;
+		}
+		elem = elem->next;
+	}
+
+	return FAILURE;
+}
+
+int32_t	iterator_edit(Iterator iter, void *new_data)
+{
+	struct list_iterator *it = iter;
+
+	if (!it)
+		return FAILURE;
+
+	it->elem->data = new_data;
+
+	return SUCCESS;
+}
+
+void*	iterator_get(Iterator iter, int32_t *result)
+{
+	struct list_iterator	*it = iter;
+	struct list_elem	*next;
+	void			*data;
+
+
+	if (!it || !it->elem) {
+		set_result(result, FAILURE);
+		return NULL;
+	}
+
+	update_links(it->elem->prev, NULL, it->elem->next);
+	if (it->elem == it->list->first)
+		update_desc(it->list, it->elem->next, it->list->last);
+	else if (it->elem == it->list->last)
+		update_desc(it->list, it->list->first, it->elem->prev);
+	it->list->nb_elements--;
+
+	data = it->elem->data;
+	if (it->elem == it->list->last)
+		next = it->elem->prev;
+	else
+		next = it->elem->next;
+	free(it->elem);
+	it->elem = next;
+	set_result(result, SUCCESS);
+
+	return data;
+}
+
+void*	iterator_read(Iterator iter, int32_t *result)
+{
+	struct list_iterator *it = iter;
+
+
+	if (!it || !it->elem) {
+		set_result(result, FAILURE);
+		return NULL;
+	}
+	set_result(result, SUCCESS);
+
+	return (it->elem->data);
+}
+
+int32_t	iterator_insert(Iterator iter, void *data, bool after)
+{
+	struct list_iterator	*it = iter;
+	struct list_elem	*elem;
+
+	if (!it)
+		return FAILURE;
+
+	if (after && it->elem == it->list->last)
+		return list_add_last(it->list, data);
+	if (!after && it->elem == it->list->first)
+		return list_add_first(it->list, data);
+
+	if (after)
+		elem = create_element(data, it->elem, it->elem->next);
+	else
+		elem = create_element(data, it->elem->prev, it->elem);
+	if (!elem)
+		return FAILURE;
+
+	update_links(elem->prev, elem, elem->next);
+
+	it->list->nb_elements++;
+
+	return SUCCESS;
+}
