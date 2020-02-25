@@ -51,6 +51,27 @@
 /******************************************************************************/
 
 /**
+ * @enum IRQ_UART_EVENT
+ * @brief Possible events for uart interrupt
+ */
+enum IRQ_UART_EVENT {
+	/** Write operation finalized */
+	WRITE_DONE,
+	/** Read operation finalized */
+	READ_DONE,
+	/** An error occurred */
+	ERROR
+};
+
+/**
+ * @brief Prototype of callback registered for an interrupt
+ * @param context - Application parameter
+ * @param event - Event that triggered the callback
+ * @param extra - Platform specific data
+ */
+typedef void (*IRQ_CALLBACK)(void *context, uint32_t event, void *extra);
+
+/**
  * @struct irq_init_param
  * @brief Structure holding the initial parameters for Interrupt Request.
  */
@@ -83,16 +104,10 @@ int32_t irq_ctrl_init(struct irq_ctrl_desc **desc,
 /* Free the resources allocated by irq_ctrl_init(). */
 int32_t irq_ctrl_remove(struct irq_ctrl_desc *desc);
 
-/**
- * @brief Registers a IRQ handling function to irq controller.
- * @param desc - The IRQ controller descriptor.
- * @param irq_id - Interrupt identifier.
- * @param irq_handler - The IRQ handler.
- * @param dev_instance - device instance.
- * @return SUCCESS in case of success, FAILURE otherwise.
- */
-int32_t irq_register(struct irq_ctrl_desc *desc, uint32_t irq_id,
-		     void (*irq_handler)(void *data), void *dev_instance);
+/* Register a callback to handle the irq events */
+int32_t irq_register_callback(struct irq_ctrl_desc *desc,
+			      uint32_t irq_id, IRQ_CALLBACK callback,
+			      void *context, void *config);
 
 /* Unregisters a generic IRQ handling function */
 int32_t irq_unregister(struct irq_ctrl_desc *desc, uint32_t irq_id);
