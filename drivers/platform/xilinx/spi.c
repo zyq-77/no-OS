@@ -58,6 +58,14 @@
 #include "spi_engine.h"
 #endif
 
+#if defined(PLATFORM_ZYNQ)
+#define SPI_CLK_FREQ_HZ(dev)    (XPAR_PS7_SPI_ ## dev ## _SPI_CLK_FREQ_HZ)
+#define SPI_NUM_INSTANCES       XPAR_XSPIPS_NUM_INSTANCES
+#elif defined(PLATFORM_ZYNQMP)
+#define SPI_CLK_FREQ_HZ(dev)    (XPAR_PSU_SPI_ ## dev ## _SPI_CLK_FREQ_HZ)
+#define SPI_NUM_INSTANCES       XPAR_XSPIPS_NUM_INSTANCES
+#endif
+
 /******************************************************************************/
 /************************ Functions Definitions *******************************/
 /******************************************************************************/
@@ -145,13 +153,21 @@ static int32_t spi_init_ps(struct spi_desc *desc,
 	int32_t				ret;
 	struct xil_spi_desc 		*xdesc;
 	struct xil_spi_init_param	*xinit;
-	const uint32_t			input_clock = 100000000;
 #ifdef XSPIPS_H
 	const uint32_t			prescaler_default = XSPIPS_CLK_PRESCALE_64;
 	const uint32_t			prescaler_min = XSPIPS_CLK_PRESCALE_4;
 	const uint32_t			prescaler_max = XSPIPS_CLK_PRESCALE_256;
 #endif
 	uint32_t			prescaler = 0u;
+	uint32_t			input_clock[SPI_NUM_INSTANCES];
+
+// There may only be 2 XSPI PS instances on PS7 and PSU architectures.
+#if (SPI_NUM_INSTANCES >= 1)
+	input_clock[0] = SPI_CLK_FREQ_HZ(0);
+#endif
+#if (SPI_NUM_INSTANCES >= 2)
+	input_clock[1] = SPI_CLK_FREQ_HZ(1);
+#endif
 
 	xdesc = (xil_spi_desc*)malloc(sizeof(xil_spi_desc));
 	if(!xdesc) {
@@ -180,8 +196,8 @@ static int32_t spi_init_ps(struct spi_desc *desc,
 		goto ps_error;
 
 	if (desc->max_speed_hz != 0u) {
-		uint32_t div = input_clock / desc->max_speed_hz;
-		uint32_t rem = input_clock % desc->max_speed_hz;
+		uint32_t div = input_clock[xinit->device_id] / desc->max_speed_hz;
+		uint32_t rem = input_clock[xinit->device_id] % desc->max_speed_hz;
 		uint32_t po2 = !(div & (div - 1)) && !rem;
 
 		// find the power of two just higher than div and
